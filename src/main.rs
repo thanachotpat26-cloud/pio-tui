@@ -55,6 +55,8 @@ fn main() -> ExitCode {
     let mut app = app::App::new(matches!(cli.command, Some(Cmd::New)), cli.refresh);
     let mut terminal = ratatui::init();
     let res = run(&mut terminal, &mut app);
+    // Stop any PlatformIO process we started before handing the terminal back.
+    app.shutdown();
     ratatui::restore();
 
     match res {
@@ -102,7 +104,14 @@ fn headless_compiledb(dir: Option<PathBuf>, env: Option<String>, clangd: bool) -
     let dir = dir.unwrap_or_else(|| PathBuf::from("."));
     let dir = dir.canonicalize().unwrap_or(dir);
     let (tx, rx) = mpsc::channel();
-    pio::spawn_compiledb(dir, env, clangd, tx);
+    let cancel = pio::Cancel::default();
+    {
+        let cancel = cancel.clone();
+        // pio runs in its own process group, so it doesn't see the terminal's
+        // SIGINT; forward Ctrl+C as a cancellation that stops the whole tree.
+        let _ = ctrlc::set_handler(move || cancel.cancel());
+    }
+    let handle = pio::spawn_compiledb(dir, env, clangd, cancel, tx);
     let mut steps = Vec::new();
     for msg in rx {
         match msg {
@@ -118,19 +127,27 @@ fn headless_compiledb(dir: Option<PathBuf>, env: Option<String>, clangd: bool) -
             }
             pio::JobMsg::Log(l) => println!("{D}  │ {l}{X}"),
             pio::JobMsg::Done(Ok(s)) => {
+                let _ = handle.join();
                 if let Some(c) = s.cdb {
-                    println!("\n{G}◆{X} compile_commands.json ready ({} entries)", c.entries);
-                    if let Some(cc) = c.compiler {
-                        if let Some(d) = std::path::Path::new(&cc).parent() {
-                            println!("  clangd: --query-driver={}/*", d.display());
-                        }
+                    println!("\n{G}◆{X} compile_commands.json ready ({} {})", c.entries, if c.entries == 1 { "entry" } else { "entries" });
+                    let cc = c.compiler.as_deref().map(std::path::Path::new);
+                    if let Some(d) = cc.filter(|p| p.is_absolute()).and_then(|p| p.parent()) {
+                        println!("  clangd: --query-driver={}/*", d.display());
                     }
+                }
+                if let Some(p) = s.log_path {
+                    println!("{D}  log: {}{X}", p.display());
                 }
                 return ExitCode::SUCCESS;
             }
-            pio::JobMsg::Done(Err(e)) => {
-                eprintln!("\n{R}error:{X} {e}");
-                return ExitCode::FAILURE;
+            pio::JobMsg::Done(Err(f)) => {
+                let _ = handle.join();
+                eprintln!("\n{R}error:{X} {}", f.message);
+                if let Some(p) = f.log_path {
+                    eprintln!("{D}  full log: {}{X}", p.display());
+                }
+                // 130 = conventional "terminated by Ctrl+C" status.
+                return if f.cancelled { ExitCode::from(130) } else { ExitCode::FAILURE };
             }
         }
     }

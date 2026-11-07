@@ -102,13 +102,14 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let line = match app.screen {
         Screen::Home => hints(&[("↑↓", "move"), ("⏎", "select"), ("n", "new"), ("c", "compiledb"), ("q", "quit")]),
         Screen::Compiledb => hints(&[("type", "directory"), ("↑↓", "environment"), ("Tab", ".clangd"), ("⏎", "generate"), ("Esc", "back")]),
-        Screen::Running => {
-            if app.run.as_ref().is_some_and(|r| r.finished.is_some()) {
-                hints(&[("⏎", "exit"), ("h", "home"), ("↑↓", "scroll log")])
-            } else {
-                hints(&[("↑↓/PgUp", "scroll log"), ("End", "follow"), ("^C", "abort")])
+        Screen::Running => match &app.run {
+            Some(r) if r.confirm_delete => hints(&[("y", "delete folder"), ("any key", "keep it")]),
+            Some(r) if r.is_running() => hints(&[("↑↓/PgUp", "scroll log"), ("End", "follow"), ("Esc/^C", "cancel")]),
+            Some(r) if matches!(&r.finished, Some((Err(f), _)) if f.partial_dir.is_some()) => {
+                hints(&[("d", "delete partial project"), ("h", "back"), ("⏎", "exit"), ("↑↓", "scroll log")])
             }
-        }
+            _ => hints(&[("⏎", "exit"), ("h", "home"), ("↑↓", "scroll log")]),
+        },
         Screen::Wizard => match app.step {
             Step::Project => hints(&[("Tab", "switch field"), ("⏎", "continue"), ("Esc", "home")]),
             Step::Platform | Step::Board => hints(&[("type", "fuzzy filter"), ("↑↓", "move"), ("⏎", "select"), ("Esc", "back")]),
@@ -129,7 +130,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_toast(f: &mut Frame, area: Rect, app: &App) {
     let Some((msg, _)) = &app.toast else { return };
-    let w = (msg.chars().count() as u16 + 6).min(area.width);
+    let w = (unicode_width::UnicodeWidthStr::width(msg.as_str()) as u16 + 6).min(area.width);
     let r = Rect { x: area.right().saturating_sub(w + 1), y: area.bottom().saturating_sub(3), width: w, height: 3 };
     f.render_widget(Clear, r);
     f.render_widget(
@@ -155,14 +156,25 @@ fn draw_input(f: &mut Frame, area: Rect, block: Block, input: &Input, focused: b
     }
 }
 
+/// Truncate to `n` terminal columns (not chars), appending `…` when cut.
 fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_owned()
-    } else {
-        let mut t: String = s.chars().take(n.saturating_sub(1)).collect();
-        t.push('…');
-        t
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if s.width() <= n {
+        return s.to_owned();
     }
+    let mut out = String::new();
+    let mut used = 0;
+    for g in s.graphemes(true) {
+        let w = g.width();
+        if used + w + 1 > n {
+            break;
+        }
+        out.push_str(g);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 fn kv(label: &str, value: impl Into<String>, color: Color) -> Line<'static> {
@@ -723,7 +735,7 @@ fn draw_running(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(run) = &app.run else { return };
     let [left, right] = Layout::horizontal([Constraint::Length(48), Constraint::Min(20)]).spacing(1).areas(area);
 
-    let result_h = if run.finished.is_some() { 11 } else { 0 };
+    let result_h = if run.finished.is_some() { 13 } else { 0 };
     let [steps_a, result_a] = Layout::vertical([Constraint::Min(5), Constraint::Length(result_h)]).areas(left);
 
     let mut lines: Vec<Line> = run
@@ -753,6 +765,10 @@ fn draw_running(f: &mut Frame, area: Rect, app: &mut App) {
         "  ·  ".fg(BORDER),
         format!("{:.1}s", elapsed.as_secs_f64()).fg(MUTED),
     ]));
+    if run.cancelling {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![spinner.fg(WARN), " stopping PlatformIO…".fg(WARN)]));
+    }
     f.render_widget(Paragraph::new(lines).block(panel("Tasks", run.finished.is_none())), steps_a);
 
     if let Some((res, _)) = &run.finished {
@@ -765,9 +781,10 @@ fn draw_running(f: &mut Frame, area: Rect, app: &mut App) {
                 ];
                 match &s.cdb {
                     Some(c) => {
-                        l.push(Line::from(vec!["compile_commands.json ".fg(FG), format!("{} entries", c.entries).fg(MUTED)]));
-                        if let Some(cc) = &c.compiler {
-                            let dir = std::path::Path::new(cc).parent().map(|p| p.display().to_string()).unwrap_or_default();
+                        l.push(Line::from(vec!["compile_commands.json ".fg(FG), format!("{} {}", c.entries, if c.entries == 1 { "entry" } else { "entries" }).fg(MUTED)]));
+                        // Only absolute compiler paths give a usable --query-driver glob.
+                        if let Some(dir) = c.compiler.as_deref().map(std::path::Path::new).filter(|p| p.is_absolute()).and_then(|p| p.parent()) {
+                            let dir = dir.display().to_string();
                             l.push(Line::from("clangd flag for full header support:".fg(MUTED)));
                             l.push(Line::from(format!("--query-driver={dir}/*").fg(STAR)));
                         }
@@ -776,16 +793,45 @@ fn draw_running(f: &mut Frame, area: Rect, app: &mut App) {
                 }
                 (panel("Result", true).border_style(Style::new().fg(OK)), l)
             }
-            Err(e) => (
-                panel("Failed", true).border_style(Style::new().fg(ERR)),
-                vec![Line::from("✗ Something went wrong".fg(ERR).bold()), Line::raw(""), Line::from(e.clone().fg(FG))],
-            ),
+            Err(fail) => {
+                let (title, color, head) = if fail.cancelled {
+                    ("Cancelled", WARN, "■ Stopped")
+                } else {
+                    ("Failed", ERR, "✗ Something went wrong")
+                };
+                let mut l = vec![Line::from(head.fg(color).bold()), Line::from(fail.message.clone().fg(FG))];
+                if let Some(dir) = &fail.partial_dir {
+                    l.push(Line::raw(""));
+                    if run.confirm_delete {
+                        l.push(Line::from("Delete this folder and everything in it?".fg(WARN).bold()));
+                        l.push(Line::from(pio::contract_tilde(dir).fg(ACCENT2)));
+                        l.push(Line::from(vec!["y".fg(ACCENT).bold(), " yes · any other key: keep".fg(MUTED)]));
+                    } else {
+                        l.push(Line::from("Partial project left at".fg(MUTED)));
+                        l.push(Line::from(pio::contract_tilde(dir).fg(ACCENT2)));
+                        l.push(Line::from(vec!["d".fg(ACCENT).bold(), " delete it".fg(MUTED)]));
+                    }
+                }
+                (panel(title, true).border_style(Style::new().fg(color)), l)
+            }
         };
+        let log_path = match res {
+            Ok(s) => s.log_path.as_ref(),
+            Err(f) => f.log_path.as_ref(),
+        };
+        let mut lines = lines;
+        if let Some(p) = log_path {
+            lines.push(Line::raw(""));
+            lines.push(Line::from(vec!["log ".fg(MUTED), pio::contract_tilde(p).fg(MUTED).italic()]));
+        }
         f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), result_a);
     }
 
     // log
-    let title = if run.scroll > 0 { format!("Output · ↑{}", run.scroll) } else { "Output".into() };
+    let mut title = if run.scroll > 0 { format!("Output · ↑{}", run.scroll) } else { "Output".into() };
+    if run.dropped > 0 {
+        title.push_str(&format!(" · {} earlier lines in log file", run.dropped));
+    }
     let block = panel(&title, false);
     let inner = block.inner(right);
     let h = inner.height as usize;

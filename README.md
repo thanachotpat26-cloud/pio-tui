@@ -5,10 +5,18 @@ A fast, friendly terminal UI for [PlatformIO](https://platformio.org) written in
 - **New project wizard**: Project → Platform → Board → Framework → Libraries → Options → Review
   - fuzzy search across every board PlatformIO knows about (~1,600), with MCU, clock, RAM and flash details
   - live PlatformIO Registry search for `lib_deps`, filtered to your platform (`Ctrl+F` toggles)
-  - writes a clean `platformio.ini`, starter `src/main.*`, `.gitignore`, and optionally runs `git init`
+  - writes a clean `platformio.ini`, `.gitignore`, a starter `src/main.*` (Arduino and ESP-IDF only;
+    other frameworks get an empty `src/` instead of a guess), and optionally runs `git init`
   - installs the platform, toolchain and libraries, with streamed output
+  - **cancel any time** (`Esc` / `Ctrl+C`): PlatformIO and every process it started are stopped, and a
+    half-created project folder can be deleted with one confirmed keypress
 - **compile_commands.json** via `pio run -t compiledb`, plus a `.clangd` that strips GCC-only
-  cross-compiler flags (`-mlongcalls`, `-fstrict-volatile-bitfields`, …) that clang rejects
+  cross-compiler flags (`-mlongcalls`, `-fstrict-volatile-bitfields`, …) that clang rejects.
+  Bare compiler names (ESP32/ESP8266 write e.g. `xtensa-esp32-elf-g++`) are rewritten to their
+  absolute toolchain path so clangd's `--query-driver` can find them.
+  For existing projects nothing else is touched: no `.gitignore` edits, and an existing `.clangd` is kept.
+- **Every run is logged** to `~/.cache/pio-tui/logs/` (last 20 kept); the path is shown when a job ends.
+- Library search honours `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`.
 - **Fast**: the board catalogue is cached (`~/.cache/pio-tui/boards.json`, refreshed weekly), and all
   PlatformIO and network work runs on background threads, so the UI never blocks
 
@@ -37,6 +45,17 @@ flag that pio-tui prints after generating the database, e.g.
 --query-driver=/home/you/.platformio/packages/toolchain-xtensa-esp32/bin/*
 ```
 
+## Requirements
+
+Linux or macOS, PlatformIO Core 6, Rust 1.85+ to build. Windows is not supported yet.
+
+## Development
+
+```sh
+cargo test                     # unit + integration tests (uses a fake `pio`; no PlatformIO needed)
+cargo test -- --ignored        # also run tests against your real PlatformIO install
+```
+
 ## Keys
 
 | Where | Keys |
@@ -45,4 +64,5 @@ flag that pio-tui prints after generating the database, e.g.
 | Wizard | `Enter` select / continue · `Esc` back · `Ctrl+N` continue · type to filter |
 | Libraries | `Enter` add/remove · `Tab` switch to selected list · `Del` remove · `Ctrl+F` platform filter |
 | Options | `↑↓` move · `Space` toggle |
-| Output | `↑↓` / `PgUp` / `PgDn` scroll · `End` follow |
+| Running job | `Esc` / `Ctrl+C` cancel · `↑↓` / `PgUp` / `PgDn` scroll · `End` follow |
+| Failed / cancelled job | `d` delete the partial project (asks `y` to confirm) · `h` back |

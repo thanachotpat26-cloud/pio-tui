@@ -7,7 +7,7 @@ use std::{
         Arc,
         mpsc::{self, Receiver, Sender},
     },
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -18,10 +18,12 @@ use ratatui::widgets::ListState;
 
 use crate::{
     input::Input,
-    pio::{self, Board, JobMsg, Library, ProjectSpec, StepState, Summary},
+    pio::{self, Board, Cancel, Failure, JobMsg, Library, ProjectSpec, StepState, Summary},
 };
 
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+/// In-memory log cap; the full log is always on disk (see `pio::open_log`).
+const LOG_KEEP: usize = 5_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -93,8 +95,20 @@ pub struct RunState {
     pub log: Vec<String>,
     rx: Receiver<JobMsg>,
     pub started: Instant,
-    pub finished: Option<(Result<Summary, String>, Duration)>,
+    pub finished: Option<(Result<Summary, Failure>, Duration)>,
     pub scroll: usize,
+    /// Lines dropped from the front of `log` because of `LOG_KEEP`.
+    pub dropped: usize,
+    cancel: Cancel,
+    handle: Option<JoinHandle<()>>,
+    pub cancelling: bool,
+    pub confirm_delete: bool,
+}
+
+impl RunState {
+    pub fn is_running(&self) -> bool {
+        self.finished.is_none()
+    }
 }
 
 type LibResult = (u64, Result<(Vec<Library>, u64), String>);
@@ -312,8 +326,20 @@ impl App {
                         if run.scroll > 0 {
                             run.scroll += 1;
                         }
+                        if run.log.len() > LOG_KEEP + LOG_KEEP / 5 {
+                            let drop = run.log.len() - LOG_KEEP;
+                            run.log.drain(..drop);
+                            run.dropped += drop;
+                            run.scroll = run.scroll.min(run.log.len());
+                        }
                     }
-                    JobMsg::Done(r) => run.finished = Some((r, run.started.elapsed())),
+                    JobMsg::Done(r) => {
+                        run.finished = Some((r, run.started.elapsed()));
+                        run.cancelling = false;
+                        if let Some(h) = run.handle.take() {
+                            let _ = h.join();
+                        }
+                    }
                 }
             }
         }
@@ -337,9 +363,10 @@ impl App {
         });
     }
 
-    fn start_job(&mut self, title: &str, spawn: impl FnOnce(Sender<JobMsg>)) {
+    fn start_job(&mut self, title: &str, spawn: impl FnOnce(Cancel, Sender<JobMsg>) -> JoinHandle<()>) {
         let (tx, rx) = mpsc::channel();
-        spawn(tx);
+        let cancel = Cancel::default();
+        let handle = spawn(cancel.clone(), tx);
         self.run = Some(RunState {
             title: title.into(),
             steps: Vec::new(),
@@ -348,8 +375,39 @@ impl App {
             started: Instant::now(),
             finished: None,
             scroll: 0,
+            dropped: 0,
+            cancel,
+            handle: Some(handle),
+            cancelling: false,
+            confirm_delete: false,
         });
         self.screen = Screen::Running;
+    }
+
+    fn cancel_job(&mut self) {
+        if let Some(run) = &mut self.run {
+            if run.is_running() && !run.cancelling {
+                run.cancel.cancel();
+                run.cancelling = true;
+            }
+        }
+    }
+
+    /// Called on exit: make sure no PlatformIO process outlives the app.
+    pub fn shutdown(&mut self) {
+        if let Some(run) = &mut self.run {
+            run.cancel.cancel();
+            if let Some(h) = run.handle.take() {
+                // The job stops pio within ~3s (SIGTERM, then SIGKILL).
+                let deadline = Instant::now() + Duration::from_secs(6);
+                while !h.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                if h.is_finished() {
+                    let _ = h.join();
+                }
+            }
+        }
     }
 
     // ───────────────────────── derived data ─────────────────────────
@@ -517,6 +575,10 @@ impl App {
     pub fn on_key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && k.code == KeyCode::Char('c') {
+            // While a job runs, Ctrl+C stops PlatformIO instead of the app.
+            if self.run.as_ref().is_some_and(|r| r.is_running()) && self.screen == Screen::Running {
+                return self.cancel_job();
+            }
             self.quit = true;
             return;
         }
@@ -789,7 +851,7 @@ impl App {
                     return self.toast(e);
                 }
                 if let Some(spec) = self.spec() {
-                    self.start_job("Creating project", |tx| pio::spawn_create(spec, tx));
+                    self.start_job("Creating project", |c, tx| pio::spawn_create(spec, c, tx));
                 }
             }
         }
@@ -808,7 +870,7 @@ impl App {
                 let dir = pio::expand_tilde(&self.cdb_dir.value());
                 let dir = dir.canonicalize().unwrap_or(dir);
                 let clangd = self.cdb_clangd;
-                self.start_job("Compilation database", |tx| pio::spawn_compiledb(dir, env, clangd, tx));
+                self.start_job("Compilation database", |c, tx| pio::spawn_compiledb(dir, env, clangd, c, tx));
             }
             _ if nav(&mut self.cdb_state, len, &k) => {}
             _ => {
@@ -821,22 +883,52 @@ impl App {
 
     fn key_running(&mut self, k: KeyEvent) {
         let Some(run) = &mut self.run else { return };
-        let done = run.finished.is_some();
         let max = run.log.len();
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => run.scroll = (run.scroll + 1).min(max),
-            KeyCode::Down | KeyCode::Char('j') => run.scroll = run.scroll.saturating_sub(1),
-            KeyCode::PageUp => run.scroll = (run.scroll + 15).min(max),
-            KeyCode::PageDown => run.scroll = run.scroll.saturating_sub(15),
-            KeyCode::End | KeyCode::Char('G') => run.scroll = 0,
-            KeyCode::Home | KeyCode::Char('g') => run.scroll = max,
-            KeyCode::Enter | KeyCode::Char('q') if done => {
+            KeyCode::Up | KeyCode::Char('k') => return run.scroll = (run.scroll + 1).min(max),
+            KeyCode::Down | KeyCode::Char('j') => return run.scroll = run.scroll.saturating_sub(1),
+            KeyCode::PageUp => return run.scroll = (run.scroll + 15).min(max),
+            KeyCode::PageDown => return run.scroll = run.scroll.saturating_sub(15),
+            KeyCode::End | KeyCode::Char('G') => return run.scroll = 0,
+            KeyCode::Home | KeyCode::Char('g') => return run.scroll = max,
+            _ => {}
+        }
+        if run.is_running() {
+            if matches!(k.code, KeyCode::Esc | KeyCode::Char('x')) {
+                self.cancel_job();
+            }
+            return;
+        }
+
+        let partial = match &run.finished {
+            Some((Err(f), _)) => f.partial_dir.clone(),
+            _ => None,
+        };
+        if run.confirm_delete {
+            run.confirm_delete = false;
+            if let (KeyCode::Char('y' | 'Y'), Some(dir)) = (k.code, partial) {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {
+                        if let Some((Err(f), _)) = &mut run.finished {
+                            f.partial_dir = None;
+                        }
+                        self.toast(format!("Deleted {}", pio::contract_tilde(&dir)));
+                    }
+                    Err(e) => self.toast(format!("Could not delete: {e}")),
+                }
+            }
+            return;
+        }
+
+        match k.code {
+            KeyCode::Char('d' | 'D') if partial.as_ref().is_some_and(|d| d.exists()) => run.confirm_delete = true,
+            KeyCode::Enter | KeyCode::Char('q') => {
                 if let Some((Ok(s), _)) = &run.finished {
                     self.exit_note = Some(format!("cd {}", shell_path(&s.project)));
                 }
                 self.quit = true;
             }
-            KeyCode::Esc | KeyCode::Char('h') if done => {
+            KeyCode::Esc | KeyCode::Char('h') => {
                 let ok = matches!(run.finished, Some((Ok(_), _)));
                 self.run = None;
                 self.installed = pio::installed_platforms();
